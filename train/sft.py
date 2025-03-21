@@ -8,10 +8,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 from datasets import load_dataset, concatenate_datasets, DatasetDict
 import transformers
 import trl
+from peft import LoraConfig, get_peft_model
 
 @dataclass
 class TrainingConfig:
-    model_name: str = field(default="Qwen/Qwen2.5-32B-Instruct")
+    model_name: str = field(default="Qwen/Qwen2.5-0.5B-Instruct")
     block_size: int = field(default=32768)
     wandb_project: Optional[str] = field(default="s1")
     wandb_entity: Optional[str] = field(default="hashimoto-group")
@@ -39,6 +40,18 @@ def train():
         model = transformers.AutoModelForCausalLM.from_pretrained(config.model_name, **kwargs)
     else:
         model = transformers.AutoModelForCausalLM.from_pretrained(config.model_name)
+
+    # loading Lora config
+    lora_config = LoraConfig(
+        r=16,
+        lora_alpha=16,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],  # Correct modules for Qwen2.5
+        lora_dropout=0.1,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    # model = get_peft_model(model, lora_config)
+    # model.print_trainable_parameters()
 
     dataset = load_dataset(config.train_file_path)
 
@@ -68,6 +81,7 @@ def train():
     args.max_seq_length = config.block_size
     trainer = trl.SFTTrainer(
         model,
+        peft_config=lora_config,
         train_dataset=dataset['train'],
         eval_dataset=dataset['test'] if 'test' in dataset else dataset['train'],
         args=args,

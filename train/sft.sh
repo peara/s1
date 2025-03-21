@@ -1,7 +1,7 @@
 # Reference Running: bash train/sft.sh
 # {'train_runtime': 5268.8407, 'train_samples_per_second': 0.949, 'train_steps_per_second': 0.119, 'train_loss': 0.1172730620391667, 'epoch': 5.0}
 uid="$(date +%Y%m%d_%H%M%S)"
-base_model="Qwen/Qwen2.5-32B-Instruct"
+base_model="Qwen/Qwen2.5-0.5B-Instruct"
 lr=1e-5
 min_lr=0
 epochs=5
@@ -14,7 +14,7 @@ push_to_hub=false
 
 torchrun --nproc-per-node ${gpu_count} --master_port 12345 \
     train/sft.py \
-    --block_size=32768 \
+    --block_size=4096 \
     --per_device_train_batch_size=${micro_batch_size} \
     --per_device_eval_batch_size=${micro_batch_size} \
     --gradient_accumulation_steps=${gradient_accumulation_steps} \
@@ -33,9 +33,12 @@ torchrun --nproc-per-node ${gpu_count} --master_port 12345 \
     --weight_decay=${weight_decay} \
     --adam_beta1=0.9 \
     --adam_beta2=0.95 \
+    --optim="adamw_bnb_8bit" \
     --output_dir="ckpts/s1-${uid}" \
     --push_to_hub=${push_to_hub} \
-    --save_only_model=True
-    # --gradient_checkpointing=True \ Enable gradient checkpointing for efficient memory usage with 8 H100 GPUs.
+    --save_only_model=True \
+    --gradient_checkpointing=True \
+    --wandb_project="s1" \
+    --wandb_entity="quang-vn-university-of-engineering-and-technology-vnu"
     # --accelerator_config='{"gradient_accumulation_kwargs": {"sync_each_batch": true}}'
 
