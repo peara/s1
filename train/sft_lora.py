@@ -15,161 +15,137 @@ import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model, PeftModel
 from transformers.modeling_utils import PreTrainedModel
 
+# === LoRA and Router Definitions ===
 
-class MoLoRALinear(nn.Module):
-    """Linear layer with multiple LoRA adapters and routing"""
-    def __init__(self, base_linear, num_adapters=10, r=16, lora_alpha=16):
+class LoRALayer(nn.Module):
+    def __init__(self, in_dim, out_dim, r=8, alpha=16):
         super().__init__()
-        self.base_linear = base_linear
-        self.num_adapters = num_adapters
         self.r = r
-        self.lora_alpha = lora_alpha
-        self.scaling = lora_alpha / r
-        
-        # Original dimensions
-        in_features, out_features = base_linear.in_features, base_linear.out_features
-        
-        # Freeze base linear layer parameters
-        for param in self.base_linear.parameters():
-            param.requires_grad = False
+        self.scaling = alpha / r
+        self.lora_A = nn.Linear(in_dim, r, bias=False)
+        self.lora_B = nn.Linear(r, out_dim, bias=False)
+        # === Proper initialization ===
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
 
-        # Create multiple LoRA adapters (A and B matrices for each adapter)
-        self.lora_A = nn.Parameter(torch.zeros(num_adapters, r, in_features))
-        self.lora_B = nn.Parameter(torch.zeros(num_adapters, out_features, r))
-        
-        # Initialize LoRA weights
-        for i in range(num_adapters):
-            nn.init.kaiming_uniform_(self.lora_A[i], a=math.sqrt(5))
-            nn.init.zeros_(self.lora_B[i])
-            
-        # Router - simple MLP
-        router_dim = 128
-        self.router = nn.Sequential(
-            nn.Linear(in_features, router_dim),
-            nn.GELU(),
-            nn.Linear(router_dim, num_adapters)
-        )
-    
     def forward(self, x):
-        # Apply base layer
-        base_output = self.base_linear(x)
-        
-        # Get batch size and sequence length
-        batch_size, seq_len, hidden_size = x.shape
-        
-        # Get router weights (batch_size x num_adapters)
-        router_input = x[:, 0]  # Use first token for routing
-        adapter_weights = F.softmax(self.router(router_input), dim=-1)  # (batch_size, num_adapters)
-        
-        # Initialize lora output
-        lora_output = torch.zeros_like(base_output)
-        
-        # Apply each adapter and weight by router predictions
-        for i in range(self.num_adapters):
-            # Reshape adapter weights for broadcasting
-            weights_for_adapter = adapter_weights[:, i].view(batch_size, 1, 1)
-            
-            # Get LoRA contribution for this adapter
-            adapter_output = (x @ self.lora_A[i].T @ self.lora_B[i].T) * self.scaling
-            
-            # Weight adapter output by router prediction
-            weighted_adapter = adapter_output * weights_for_adapter
-            
-            # Add to total LoRA output
-            lora_output += weighted_adapter
-        
-        # Combine base output with weighted LoRA output
-        return base_output + lora_output
+        return self.lora_B(self.lora_A(x)) * self.scaling
 
 
-class MoLoRAModel(PreTrainedModel):
-    """Base class for MoLoRA models - inherits PreTrainedModel for full compatibility"""
-    
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, num_adapters=10, target_modules=None, r=16, lora_alpha=16, *args, **kwargs):
-        # Load the base model using standard from_pretrained
-        base_model = transformers.AutoModelForCausalLM.from_pretrained(
-            pretrained_model_name_or_path, *args, **kwargs
+class GlobalRouter(nn.Module):
+    def __init__(self, hidden_size, num_loras):
+        super().__init__()
+        self.router = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, num_loras),
         )
-        
-        # Create and return MoLoRA-enabled model
-        molora_model = cls(base_model.config)
-        molora_model.init_molora(base_model, num_adapters, target_modules, r, lora_alpha)
-        return molora_model
-    
-    def __init__(self, config):
-        # ignore num_adapters as it is not a standard config parameter
-        # and is handled in init_molora
-        super().__init__(config)
-        # Initialize basic properties but don't set up layers yet
-        # This happens in init_molora after the base model is loaded
-    
-    def init_molora(self, pretrained_model, num_adapters, target_modules, r, lora_alpha):
-        """Initialize MoLoRA with a base model"""
-        self.pretrained_model = pretrained_model
-        self.num_adapters = num_adapters
-        self.target_modules = target_modules
-        self.r = r
-        self.lora_alpha = lora_alpha
-        
-        # Freeze all base model parameters
-        for param in self.pretrained_model.parameters():
+        self.cached_probs = None
+
+    def forward(self, x):
+        pooled = x[:, 0]
+        logits = self.router(pooled.to(self.router[0].weight.dtype))
+        self.cached_probs = torch.softmax(logits, dim=-1)[0]  # shape: [num_loras]
+        return self.cached_probs
+
+
+class LayerWithLoRAMixture(nn.Module):
+    def __init__(self, base_layer, lora_list, router_ref):
+        super().__init__()
+        self.base_layer = base_layer
+        self.lora_list = nn.ModuleList(lora_list)
+        self._router_ref = router_ref
+
+    def forward(self, x):
+        out = self.base_layer(x)
+        probs = self._router_ref.cached_probs  # shape: [num_loras]
+        if probs is None:
+            return out
+        lora_outputs = torch.stack([l(x) for l in self.lora_list], dim=0)  # [num_loras, B, T, H]
+        weighted = torch.einsum("l,lbth->bth", probs, lora_outputs)
+        return out + weighted
+
+# === Utility ===
+
+def expand_attention_mask(attention_mask, dtype, tgt_len=None):
+    batch_size, seq_len = attention_mask.shape
+    if tgt_len is None:
+        tgt_len = seq_len
+
+    causal_mask = torch.tril(torch.ones((tgt_len, seq_len), dtype=dtype, device=attention_mask.device))
+    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+    expanded_mask = attention_mask[:, None, None, :] * causal_mask
+    expanded_mask = (1.0 - expanded_mask) * torch.finfo(dtype).min
+    return expanded_mask
+
+
+# === Router-Integrated Model Wrapper ===
+
+class QwenRouterWrapper(nn.Module):
+    def freeze_base_model(self):
+        for param in self.model.parameters():
             param.requires_grad = False
-            
-        # Replace target modules with MoLoRA versions
-        self._replace_modules()
-    
-    def _replace_modules(self):
-        """Replace target linear layers with MoLoRA versions"""
-        # Track replaced modules
-        self.molora_layers = {}
+        print("Base model frozen.")
 
-        # Find and replace target modules
-        for name, module in self.pretrained_model.named_modules():
-            if any(target in name for target in self.target_modules) and isinstance(module, nn.Linear):
-                # Get parent module
-                parent_name, child_name = name.rsplit(".", 1)
-                parent = self.pretrained_model
+    def __init__(self, model, router_cutoff_layer=2, num_loras=4, lora_r=8, lora_alpha=16):
+        super().__init__()
+        self.model = model
+        self.config = model.config
+        self.num_layers = len(model.model.layers)
+        self.router_cutoff = router_cutoff_layer
 
-                parts = parent_name.split('.')
-                for part in parts:
-                    parent = getattr(parent, part)
-                
-                # Replace with MoLoRA version
-                molora_layer = MoLoRALinear(
-                    module, 
-                    num_adapters=self.num_adapters,
-                    r=self.r,
-                    lora_alpha=self.lora_alpha
-                )
-                setattr(parent, child_name, molora_layer)
-                self.molora_layers[name] = molora_layer
-                
-                logging.info(f"Replaced {name} with MoLoRA layer")
-    
-    def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
-        # Pass through to base model with explicit parameters
-        return self.pretrained_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            **kwargs
-        )
+        self.freeze_base_model()  # Freeze base model
 
-    def prepare_inputs_for_generation(self, *args, **kwargs):
-        """Pass through to base model's prepare_inputs_for_generation"""
-        return self.pretrained_model.prepare_inputs_for_generation(*args, **kwargs)
-   
-    def get_router_weights(self):
-        """Get router weights for analysis"""
-        weights = {}
-        for name, layer in self.molora_layers.items():
-            weights[name] = {
-                'A': layer.lora_A.data.clone(),
-                'B': layer.lora_B.data.clone(),
-                'router': layer.router[0].weight.data.clone(),
-            }
-        return weights
+        total_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"Trainable parameters: {total_trainable:,}")
+
+        self.router = GlobalRouter(model.config.hidden_size, num_loras)
+        self.modified_layers = nn.ModuleList()
+
+        for i, block in enumerate(model.model.layers):
+            if i >= self.router_cutoff:
+                mlp = block.mlp
+                lora_list = [LoRALayer(model.config.hidden_size, model.config.hidden_size, lora_r, lora_alpha) for _ in range(num_loras)]
+                new_ffn = LayerWithLoRAMixture(mlp, lora_list, router_ref=self.router)
+                block.mlp = new_ffn
+                self.modified_layers.append(new_ffn)
+
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        hidden = self.model.model.embed_tokens(input_ids)
+
+        batch_size, seq_len = input_ids.shape
+        position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+
+        extended_attention_mask = expand_attention_mask(attention_mask, dtype=hidden.dtype, tgt_len=seq_len)
+
+        for i in range(self.router_cutoff):
+            hidden = self.model.model.layers[i](
+                hidden,
+                attention_mask=extended_attention_mask,
+                position_ids=position_ids
+            )[0]
+
+        _ = self.router(hidden)  # sets cached_probs
+
+        for i in range(self.router_cutoff, self.num_layers):
+            hidden = self.model.model.layers[i](
+                hidden,
+                attention_mask=extended_attention_mask,
+                position_ids=position_ids
+            )[0]
+
+        hidden = self.model.lm_head(hidden)
+        if labels is not None:
+            loss_fn = nn.CrossEntropyLoss()
+            shift_logits = hidden[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            return {'loss': loss, 'logits': hidden}
+
+        return {'logits': hidden}
 
 @dataclass
 class TrainingConfig:
@@ -197,28 +173,19 @@ def train():
     log_config = {**asdict(config), **asdict(args)}
     logging.info(f"Training config: {log_config}")
 
-    # Create MoLoRA model with routing using from_pretrained pattern
-    model = MoLoRAModel.from_pretrained(
-        config.model_name,
-        num_adapters=2,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        r=16,
-        lora_alpha=16,
-        device_map="auto" if "70B" in config.model_name else None,
-        torch_dtype="auto" if "70B" in config.model_name else None,
-        attn_implementation="flash_attention_2" if "70B" in config.model_name else None,
-        use_cache=False if "70B" in config.model_name else None
-    )
+    model = transformers.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+    wrapped_model = QwenRouterWrapper(model, router_cutoff_layer=2)
     
     # Count trainable parameters
     trainable_params = 0
     all_params = 0
-    for name, param in model.named_parameters():
+    for name, param in wrapped_model.named_parameters():
         all_params += param.numel()
         if param.requires_grad:
+            print('Trainable:', name)
             trainable_params += param.numel()
     logging.info(f"Trainable parameters: {trainable_params:,d} ({trainable_params/all_params:.2%} of all parameters)")
-    
+
     # Load dataset
     dataset = load_from_disk(config.train_file_path)
 
@@ -246,7 +213,7 @@ def train():
     
     # Initialize trainer with our MoLoRA model
     trainer = trl.SFTTrainer(
-        model,
+        wrapped_model,
         train_dataset=dataset['train'],
         eval_dataset=dataset['test'] if 'test' in dataset else dataset['train'],
         args=args,
