@@ -6,7 +6,7 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-from datasets import load_from_disk
+from datasets import load_from_disk, load_dataset
 import transformers
 import trl
 import torch
@@ -18,18 +18,19 @@ from transformers.modeling_utils import PreTrainedModel
 # === LoRA and Router Definitions ===
 
 class LoRALayer(nn.Module):
-    def __init__(self, in_dim, out_dim, r=8, alpha=16):
+    def __init__(self, in_dim, out_dim, r=8, alpha=16, dropout=0.1):
         super().__init__()
         self.r = r
         self.scaling = alpha / r
         self.lora_A = nn.Linear(in_dim, r, bias=False)
         self.lora_B = nn.Linear(r, out_dim, bias=False)
+        self.lora_dropout = nn.Dropout(dropout)
         # === Proper initialization ===
         nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B.weight)
 
     def forward(self, x):
-        return self.lora_B(self.lora_A(x)) * self.scaling
+        return self.lora_B(self.lora_A(self.lora_dropout(x))) * self.scaling
 
 
 class GlobalRouter(nn.Module):
@@ -61,9 +62,18 @@ class LayerWithLoRAMixture(nn.Module):
         probs = self._router_ref.cached_probs  # shape: [num_loras]
         if probs is None:
             return out
-        lora_outputs = torch.stack([l(x) for l in self.lora_list], dim=0)  # [num_loras, B, T, H]
-        weighted = torch.einsum("l,lbth->bth", probs, lora_outputs)
-        return out + weighted
+            
+        # Process each LoRA separately and combine
+        lora_outputs = []
+        for i, lora in enumerate(self.lora_list):
+            lora_out = lora(x) * probs[i]  # Scale output by router probability
+            lora_outputs.append(lora_out)
+            
+        # Sum all lora outputs
+        lora_contribution = sum(lora_outputs)
+        
+        # Add to base output
+        return out + lora_contribution
 
 # === Utility ===
 
@@ -187,7 +197,7 @@ def train():
     logging.info(f"Trainable parameters: {trainable_params:,d} ({trainable_params/all_params:.2%} of all parameters)")
 
     # Load dataset
-    dataset = load_from_disk(config.train_file_path)
+    dataset = load_dataset(config.train_file_path)
 
     # Setting up the tokenizer
     tokenizer = transformers.AutoTokenizer.from_pretrained(config.model_name, use_fast=True)
