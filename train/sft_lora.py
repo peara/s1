@@ -132,20 +132,25 @@ class QwenRouterWrapper(nn.Module):
         extended_attention_mask = expand_attention_mask(attention_mask, dtype=hidden.dtype, tgt_len=seq_len)
 
         for i in range(self.router_cutoff):
-            hidden = self.model.model.layers[i](
+            layer_outputs = self.model.model.layers[i](
                 hidden,
                 attention_mask=extended_attention_mask,
                 position_ids=position_ids
-            )[0]
+            )
+            hidden = layer_outputs[0]
 
         _ = self.router(hidden)  # sets cached_probs
 
         for i in range(self.router_cutoff, self.num_layers):
-            hidden = self.model.model.layers[i](
+            layer_outputs = self.model.model.layers[i](
                 hidden,
                 attention_mask=extended_attention_mask,
                 position_ids=position_ids
-            )[0]
+            )
+            hidden = layer_outputs[0]
+        
+        if hasattr(self.model.model, 'norm'):
+            hidden = self.model.model.norm(hidden)
 
         hidden = self.model.lm_head(hidden)
         if labels is not None:
@@ -183,7 +188,7 @@ def train():
     log_config = {**asdict(config), **asdict(args)}
     logging.info(f"Training config: {log_config}")
 
-    model = transformers.AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+    model = transformers.AutoModelForCausalLM.from_pretrained(config.model_name)
     wrapped_model = QwenRouterWrapper(model, router_cutoff_layer=2)
     
     # Count trainable parameters
