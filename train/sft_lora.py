@@ -128,8 +128,9 @@ class QwenRouterWrapper(nn.Module):
                 attention_mask=attention_mask,
                 output_hidden_states=True,
             )
-            router_hidden = pre_outputs.hidden_states[self.router_cutoff]
-            _ = self.router(router_hidden)
+
+        router_hidden = pre_outputs.hidden_states[self.router_cutoff]
+        _ = self.router(router_hidden)
         
         # Now do the actual forward pass with router probabilities set
         outputs = self.model(
