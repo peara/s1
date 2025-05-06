@@ -121,46 +121,66 @@ class QwenRouterWrapper(nn.Module):
                 self.modified_layers.append(new_ffn)
 
     def forward(self, input_ids, attention_mask=None, labels=None):
-        hidden = self.model.model.embed_tokens(input_ids)
-
-        batch_size, seq_len = input_ids.shape
-        position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
-
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids)
-
-        extended_attention_mask = expand_attention_mask(attention_mask, dtype=hidden.dtype, tgt_len=seq_len)
-
-        for i in range(self.router_cutoff):
-            layer_outputs = self.model.model.layers[i](
-                hidden,
-                attention_mask=extended_attention_mask,
-                position_ids=position_ids
+        # Pre-compute router probabilities
+        with torch.no_grad():
+            pre_outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
             )
-            hidden = layer_outputs[0]
-
-        _ = self.router(hidden)  # sets cached_probs
-
-        for i in range(self.router_cutoff, self.num_layers):
-            layer_outputs = self.model.model.layers[i](
-                hidden,
-                attention_mask=extended_attention_mask,
-                position_ids=position_ids
-            )
-            hidden = layer_outputs[0]
+            router_hidden = pre_outputs.hidden_states[self.router_cutoff]
+            _ = self.router(router_hidden)
         
-        if hasattr(self.model.model, 'norm'):
-            hidden = self.model.model.norm(hidden)
+        # Now do the actual forward pass with router probabilities set
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+        )
+        
+        return outputs
 
-        hidden = self.model.lm_head(hidden)
-        if labels is not None:
-            loss_fn = nn.CrossEntropyLoss()
-            shift_logits = hidden[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            return {'loss': loss, 'logits': hidden}
+    # def forward(self, input_ids, attention_mask=None, labels=None):
+    #     hidden = self.model.model.embed_tokens(input_ids)
 
-        return {'logits': hidden}
+    #     batch_size, seq_len = input_ids.shape
+    #     position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+
+    #     if attention_mask is None:
+    #         attention_mask = torch.ones_like(input_ids)
+
+    #     extended_attention_mask = expand_attention_mask(attention_mask, dtype=hidden.dtype, tgt_len=seq_len)
+
+    #     for i in range(self.router_cutoff):
+    #         layer_outputs = self.model.model.layers[i](
+    #             hidden,
+    #             attention_mask=extended_attention_mask,
+    #             position_ids=position_ids
+    #         )
+    #         hidden = layer_outputs[0]
+
+    #     _ = self.router(hidden)  # sets cached_probs
+
+    #     for i in range(self.router_cutoff, self.num_layers):
+    #         layer_outputs = self.model.model.layers[i](
+    #             hidden,
+    #             attention_mask=extended_attention_mask,
+    #             position_ids=position_ids
+    #         )
+    #         hidden = layer_outputs[0]
+        
+    #     if hasattr(self.model.model, 'norm'):
+    #         hidden = self.model.model.norm(hidden)
+
+    #     hidden = self.model.lm_head(hidden)
+    #     if labels is not None:
+    #         loss_fn = nn.CrossEntropyLoss()
+    #         shift_logits = hidden[..., :-1, :].contiguous()
+    #         shift_labels = labels[..., 1:].contiguous()
+    #         loss = loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+    #         return {'loss': loss, 'logits': hidden}
+
+    #     return {'logits': hidden}
 
 @dataclass
 class TrainingConfig:
