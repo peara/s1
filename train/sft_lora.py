@@ -209,7 +209,13 @@ def train():
     logging.info(f"Training config: {log_config}")
 
     model = transformers.AutoModelForCausalLM.from_pretrained(config.model_name)
-    wrapped_model = QwenRouterWrapper(model, router_cutoff_layer=2)
+    wrapped_model = QwenRouterWrapper(
+        model,
+        router_cutoff_layer=config.router_cutoff_layer,
+        num_loras=config.num_loras,
+        lora_r=config.lora_r,
+        lora_alpha=config.lora_alpha
+    )
     
     # Count trainable parameters
     trainable_params = 0
