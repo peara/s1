@@ -114,11 +114,12 @@ class QwenRouterWrapper(nn.Module):
 
         for i, block in enumerate(model.model.layers):
             if i >= self.router_cutoff:
-                mlp = block.mlp
-                lora_list = [LoRALayer(model.config.hidden_size, model.config.hidden_size, lora_r, lora_alpha) for _ in range(num_loras)]
-                new_ffn = LayerWithLoRAMixture(mlp, lora_list, router_ref=self.router)
-                block.mlp = new_ffn
-                self.modified_layers.append(new_ffn)
+                for block_name in ['q_proj', 'k_proj', 'v_proj']:
+                    mlp = getattr(block.seft_attn, block_name)
+                    lora_list = [LoRALayer(model.config.hidden_size, model.config.hidden_size, lora_r, lora_alpha) for _ in range(num_loras)]
+                    new_ffn = LayerWithLoRAMixture(mlp, lora_list, router_ref=self.router)
+                    setattr(block.seft_attn, block_name, new_ffn)
+                    self.modified_layers.append(new_ffn)
 
     def forward(self, input_ids, attention_mask=None, labels=None):
         # Pre-compute router probabilities
@@ -141,47 +142,49 @@ class QwenRouterWrapper(nn.Module):
         
         return outputs
 
-    # def forward(self, input_ids, attention_mask=None, labels=None):
-    #     hidden = self.model.model.embed_tokens(input_ids)
+    """
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        hidden = self.model.model.embed_tokens(input_ids)
 
-    #     batch_size, seq_len = input_ids.shape
-    #     position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+        batch_size, seq_len = input_ids.shape
+        position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
 
-    #     if attention_mask is None:
-    #         attention_mask = torch.ones_like(input_ids)
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
 
-    #     extended_attention_mask = expand_attention_mask(attention_mask, dtype=hidden.dtype, tgt_len=seq_len)
+        extended_attention_mask = expand_attention_mask(attention_mask, dtype=hidden.dtype, tgt_len=seq_len)
 
-    #     for i in range(self.router_cutoff):
-    #         layer_outputs = self.model.model.layers[i](
-    #             hidden,
-    #             attention_mask=extended_attention_mask,
-    #             position_ids=position_ids
-    #         )
-    #         hidden = layer_outputs[0]
+        for i in range(self.router_cutoff):
+            layer_outputs = self.model.model.layers[i](
+                hidden,
+                attention_mask=extended_attention_mask,
+                position_ids=position_ids
+            )
+            hidden = layer_outputs[0]
 
-    #     _ = self.router(hidden)  # sets cached_probs
+        _ = self.router(hidden)  # sets cached_probs
 
-    #     for i in range(self.router_cutoff, self.num_layers):
-    #         layer_outputs = self.model.model.layers[i](
-    #             hidden,
-    #             attention_mask=extended_attention_mask,
-    #             position_ids=position_ids
-    #         )
-    #         hidden = layer_outputs[0]
+        for i in range(self.router_cutoff, self.num_layers):
+            layer_outputs = self.model.model.layers[i](
+                hidden,
+                attention_mask=extended_attention_mask,
+                position_ids=position_ids
+            )
+            hidden = layer_outputs[0]
         
-    #     if hasattr(self.model.model, 'norm'):
-    #         hidden = self.model.model.norm(hidden)
+        if hasattr(self.model.model, 'norm'):
+            hidden = self.model.model.norm(hidden)
 
-    #     hidden = self.model.lm_head(hidden)
-    #     if labels is not None:
-    #         loss_fn = nn.CrossEntropyLoss()
-    #         shift_logits = hidden[..., :-1, :].contiguous()
-    #         shift_labels = labels[..., 1:].contiguous()
-    #         loss = loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-    #         return {'loss': loss, 'logits': hidden}
+        hidden = self.model.lm_head(hidden)
+        if labels is not None:
+            loss_fn = nn.CrossEntropyLoss()
+            shift_logits = hidden[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            return {'loss': loss, 'logits': hidden}
 
-    #     return {'logits': hidden}
+        return {'logits': hidden}
+    """
 
 @dataclass
 class TrainingConfig:
@@ -193,8 +196,9 @@ class TrainingConfig:
     dagger: bool = field(default=False)
 
     def __post_init__(self):
-        os.environ['WANDB_PROJECT'] = self.wandb_project
-        os.environ['WANDB_ENTITY'] = self.wandb_entity
+        # os.environ['WANDB_PROJECT'] = self.wandb_project
+        # os.environ['WANDB_ENTITY'] = self.wandb_entity
+        pass
 
 def train():
     # parsing input
@@ -252,15 +256,15 @@ def train():
     
     args.dataset_text_field = 'text'
     args.max_seq_length = config.block_size
+    args.ddp_find_unused_parameters = False
     
     # Initialize trainer with our MoLoRA model
     trainer = trl.SFTTrainer(
-        wrapped_model,
+        model=wrapped_model,
         train_dataset=dataset['train'],
         eval_dataset=dataset['test'] if 'test' in dataset else dataset['train'],
         args=args,
         data_collator=collator,
-        # No peft_config since we're handling adapter setup ourselves
     )
 
     trainer.train()
