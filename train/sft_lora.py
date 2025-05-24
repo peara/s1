@@ -157,7 +157,7 @@ class QwenRouterWrapper(nn.Module):
         
         # Get rotary position embeddings
         # For Qwen2 models, this creates the cos/sin tensors needed by attention layers
-        position_embeddings = self.model.model.rotary_emb(position_ids)
+        position_embeddings = self.model.model.rotary_emb(x=hidden, position_ids=position_ids)
 
         for i in range(self.router_cutoff):
             layer_outputs = self.model.model.layers[i](
