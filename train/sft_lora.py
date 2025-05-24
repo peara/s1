@@ -115,12 +115,13 @@ class QwenRouterWrapper(nn.Module):
         for i, block in enumerate(model.model.layers):
             if i >= self.router_cutoff:
                 for block_name in ['q_proj', 'k_proj', 'v_proj']:
-                    mlp = getattr(block.seft_attn, block_name)
-                    lora_list = [LoRALayer(model.config.hidden_size, model.config.hidden_size, lora_r, lora_alpha) for _ in range(num_loras)]
+                    mlp = getattr(block.self_attn, block_name)
+                    lora_list = [LoRALayer(mlp.in_features, mlp.out_features, lora_r, lora_alpha) for _ in range(num_loras)]
                     new_ffn = LayerWithLoRAMixture(mlp, lora_list, router_ref=self.router)
-                    setattr(block.seft_attn, block_name, new_ffn)
+                    setattr(block.self_attn, block_name, new_ffn)
                     self.modified_layers.append(new_ffn)
 
+    """
     def forward(self, input_ids, attention_mask=None, labels=None):
         # Pre-compute router probabilities
         with torch.no_grad():
@@ -141,8 +142,8 @@ class QwenRouterWrapper(nn.Module):
         )
         
         return outputs
-
     """
+
     def forward(self, input_ids, attention_mask=None, labels=None):
         hidden = self.model.model.embed_tokens(input_ids)
 
@@ -184,7 +185,6 @@ class QwenRouterWrapper(nn.Module):
             return {'loss': loss, 'logits': hidden}
 
         return {'logits': hidden}
-    """
 
 @dataclass
 class TrainingConfig:
@@ -216,10 +216,10 @@ def train():
     model = transformers.AutoModelForCausalLM.from_pretrained(config.model_name)
     wrapped_model = QwenRouterWrapper(
         model,
-        router_cutoff_layer=config.router_cutoff_layer,
-        num_loras=config.num_loras,
-        lora_r=config.lora_r,
-        lora_alpha=config.lora_alpha
+        router_cutoff_layer=2,
+        num_loras=1,
+        lora_r=2,
+        lora_alpha=4
     )
     
     # Count trainable parameters

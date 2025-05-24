@@ -3,14 +3,15 @@
 # Reference Running: bash train/sft.sh
 # {'train_runtime': 5268.8407, 'train_samples_per_second': 0.949, 'train_steps_per_second': 0.119, 'train_loss': 0.1172730620391667, 'epoch': 5.0}
 uid="$(date +%Y%m%d_%H%M%S)"
-base_model="Qwen/Qwen2.5-1.5B-Instruct"
+base_model="Qwen/Qwen2.5-0.5B-Instruct"
 router_cutoff_layer=6
 num_loras=4
 lora_r=128
 lora_alpha=256
 
-lr=1e-5
-min_lr=0
+# lr=1e-5
+lr=3e-4
+min_lr=1e-6
 epochs=5
 weight_decay=1e-4 # -> the same training pipe as slurm_training
 micro_batch_size=1 # -> batch_size will be 16 if 16 gpus
@@ -29,10 +30,6 @@ torchrun --nproc-per-node ${gpu_count} --master_port 12345 \
     --num_train_epochs=${epochs} \
     --train_file_path="simplescaling/s1K_tokenized" \
     --model_name=${base_model} \
-    --router_cutoff_layer=${router_cutoff_layer} \
-    --num_loras=${num_loras} \
-    --lora_r=${lora_r} \
-    --lora_alpha=${lora_alpha} \
     --warmup_ratio=0.05 \
     --bf16=True \
     --eval_strategy="no" \
