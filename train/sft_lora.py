@@ -154,12 +154,17 @@ class QwenRouterWrapper(nn.Module):
             attention_mask = torch.ones_like(input_ids)
 
         extended_attention_mask = expand_attention_mask(attention_mask, dtype=hidden.dtype, tgt_len=seq_len)
+        
+        # Get rotary position embeddings
+        # For Qwen2 models, this creates the cos/sin tensors needed by attention layers
+        position_embeddings = self.model.model.rotary_emb(position_ids)
 
         for i in range(self.router_cutoff):
             layer_outputs = self.model.model.layers[i](
                 hidden,
                 attention_mask=extended_attention_mask,
-                position_ids=position_ids
+                position_ids=position_ids,
+                position_embeddings=position_embeddings  # Pass the rotary embeddings
             )
             hidden = layer_outputs[0]
 
@@ -169,7 +174,8 @@ class QwenRouterWrapper(nn.Module):
             layer_outputs = self.model.model.layers[i](
                 hidden,
                 attention_mask=extended_attention_mask,
-                position_ids=position_ids
+                position_ids=position_ids,
+                position_embeddings=position_embeddings  # Pass the rotary embeddings
             )
             hidden = layer_outputs[0]
         
