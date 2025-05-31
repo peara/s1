@@ -140,9 +140,11 @@ class RouterAnalysisCallback(transformers.TrainerCallback):
         # Log to wandb if it's active
         if wandb.run is not None:
             # Log raw data
+            diversity_loss = getattr(self.model.router, 'last_diversity_loss', 0.0)
             wandb.log({
                 "router/temperature": temperature,
                 "router/avg_entropy": np.mean([log['entropy'] for log in step_logs]) if step_logs else 0.0,
+                "router/diversity_loss": diversity_loss
             }, step=step)
             
             # Generate and log visualization if we have enough data points
@@ -268,7 +270,7 @@ class LoRALayer(nn.Module):
 
 
 class GlobalRouter(nn.Module):
-    def __init__(self, hidden_size, num_loras, temperature=1.0):
+    def __init__(self, hidden_size, num_loras, temperature=1.0, diversity_weight=0.1):
         super().__init__()
         self.router = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
@@ -277,13 +279,45 @@ class GlobalRouter(nn.Module):
         )
         self.cached_probs = None
         self.temperature = temperature
+        self.diversity_weight = diversity_weight
+        self.num_loras = num_loras
+        
+        # Register buffers to track usage statistics (will be saved with model)
+        self.register_buffer('usage_count', torch.zeros(num_loras))
+        self.register_buffer('total_samples', torch.tensor(0.))
+        self.last_diversity_loss = 0.0
 
-    def forward(self, x):
+    def forward(self, x, return_loss=False):
         pooled = x[:, 0]
         logits = self.router(pooled.to(self.router[0].weight.dtype))
         # Apply temperature scaling - higher temperature = more uniform distribution
         scaled_logits = logits / self.temperature
-        self.cached_probs = torch.softmax(scaled_logits, dim=-1)[0]  # shape: [num_loras]
+        probs = torch.softmax(scaled_logits, dim=-1)
+        self.cached_probs = probs[0]  # shape: [num_loras]
+        
+        # Update usage statistics when training
+        if self.training:
+            with torch.no_grad():
+                # Add current probabilities to running count
+                self.usage_count += self.cached_probs.detach()
+                self.total_samples += 1
+        
+        # Calculate diversity loss if requested
+        if return_loss and self.training and self.total_samples > 0:
+            # Get the historical usage distribution
+            usage_dist = self.usage_count / self.total_samples
+            
+            # Calculate KL divergence from uniform distribution
+            # Higher KL = less uniform = more diversity loss
+            uniform_dist = torch.ones_like(usage_dist) / self.num_loras
+            kl_div = torch.sum(usage_dist * torch.log((usage_dist + 1e-10) / (uniform_dist + 1e-10)))
+            
+            # Use KL divergence as diversity loss
+            diversity_loss = self.diversity_weight * kl_div
+            self.last_diversity_loss = diversity_loss.item()
+            
+            return self.cached_probs, diversity_loss
+            
         return self.cached_probs
 
 
@@ -334,7 +368,7 @@ class QwenRouterWrapper(nn.Module):
             param.requires_grad = False
         print("Base model frozen.")
 
-    def __init__(self, model, router_cutoff_layer=2, num_loras=4, lora_r=8, lora_alpha=16, temperature=1.0):
+    def __init__(self, model, router_cutoff_layer=2, num_loras=4, lora_r=8, lora_alpha=16, temperature=1.0, diversity_weight=0.1):
         super().__init__()
         self.model = model
         self.config = model.config
@@ -346,7 +380,7 @@ class QwenRouterWrapper(nn.Module):
         total_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print(f"Trainable parameters: {total_trainable:,}")
 
-        self.router = GlobalRouter(model.config.hidden_size, num_loras, temperature)
+        self.router = GlobalRouter(model.config.hidden_size, num_loras, temperature, diversity_weight)
         self.modified_layers = nn.ModuleList()
 
         for i, block in enumerate(model.model.layers):
@@ -405,7 +439,14 @@ class QwenRouterWrapper(nn.Module):
             )
             hidden = layer_outputs[0]
 
-        _ = self.router(hidden)  # sets cached_probs
+        # Get router probabilities and diversity loss when training
+        router_output = self.router(hidden, return_loss=self.training)
+        if self.training and isinstance(router_output, tuple):
+            # When training, we get both probabilities and diversity loss
+            _, diversity_loss = router_output
+        else:
+            # During inference, we only get probabilities
+            diversity_loss = 0.0
 
         for i in range(self.router_cutoff, self.num_layers):
             layer_outputs = self.model.model.layers[i](
@@ -425,7 +466,10 @@ class QwenRouterWrapper(nn.Module):
             shift_logits = hidden[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            return {'loss': loss, 'logits': hidden}
+            
+            # Add diversity loss to the main loss
+            total_loss = loss + diversity_loss
+            return {'loss': total_loss, 'logits': hidden}
 
         return {'logits': hidden}
 
@@ -465,7 +509,8 @@ def train():
         num_loras=10,
         lora_r=128,
         lora_alpha=256,
-        temperature=1.0
+        temperature=3.0,  # High temperature for more uniform initial distribution
+        diversity_weight=0.5  # Fairly strong diversity penalty to encourage uniform usage
     )
     
     # Count trainable parameters
@@ -519,7 +564,7 @@ def train():
         tokenizer=tokenizer,
         dataset=dataset['train'],
         num_examples=10,
-        log_freq=100,
+        log_freq=5,
         log_dir=os.path.join(args.output_dir, 'router_logs')
     )
 
@@ -536,8 +581,8 @@ def train():
     trainer.add_callback(router_callback)
 
     trainer.train()
-    trainer.save_model(output_dir=args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
+    # trainer.save_model(output_dir=args.output_dir)
+    # tokenizer.save_pretrained(args.output_dir)
     
     trainer.accelerator.wait_for_everyone()
 
