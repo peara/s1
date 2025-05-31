@@ -39,7 +39,7 @@ class RouterAnalysisCallback(transformers.TrainerCallback):
         self.example_inputs = []
         
         for idx in indices:
-            example = dataset[idx]
+            example = dataset[int(idx)]
             text = example['text'] if 'text' in example else str(example)
             self.example_texts.append(text[:100] + "..." if len(text) > 100 else text)
             
@@ -102,11 +102,12 @@ class RouterAnalysisCallback(transformers.TrainerCallback):
         
         step_logs = []
         
+        temperature = getattr(self.model.router, 'temperature', 1.0)
+        
         # Get router probabilities for each example
         for ex_id, inputs in enumerate(self.example_inputs):
             try:
                 probs = self.get_router_probs(inputs)
-                temperature = getattr(self.model.router, 'temperature', 1.0)
                 
                 # Calculate entropy of distribution
                 entropy = -np.sum(probs * np.log(probs + 1e-10))
@@ -139,7 +140,7 @@ class RouterAnalysisCallback(transformers.TrainerCallback):
             # Log raw data
             wandb.log({
                 "router/temperature": temperature,
-                "router/avg_entropy": np.mean([log['entropy'] for log in step_logs]),
+                "router/avg_entropy": np.mean([log['entropy'] for log in step_logs]) if step_logs else 0.0,
             }, step=step)
             
             # Generate and log visualization if we have enough data points
