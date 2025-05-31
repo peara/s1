@@ -63,7 +63,9 @@ class RouterAnalysisCallback(transformers.TrainerCallback):
     
     def get_router_probs(self, input_dict):
         """Get router probabilities for a given input."""
-        input_ids = input_dict['input_ids'].to(self.model.device)
+        # Get device from model parameters instead of directly from model
+        device = next(self.model.parameters()).device
+        input_ids = input_dict['input_ids'].to(device)
         
         # Extract hidden states for router
         with torch.no_grad():
