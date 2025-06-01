@@ -141,10 +141,13 @@ class RouterAnalysisCallback(transformers.TrainerCallback):
         if wandb.run is not None:
             # Log raw data
             diversity_loss = getattr(self.model.router, 'last_diversity_loss', 0.0)
+            expert_dropout = getattr(self.model.router, 'expert_dropout', 0.0)
+            
             wandb.log({
                 "router/temperature": temperature,
                 "router/avg_entropy": np.mean([log['entropy'] for log in step_logs]) if step_logs else 0.0,
-                "router/diversity_loss": diversity_loss
+                "router/diversity_loss": diversity_loss,
+                "router/expert_dropout": expert_dropout
             }, step=step)
             
             # Generate and log visualization if we have enough data points
@@ -270,7 +273,7 @@ class LoRALayer(nn.Module):
 
 
 class GlobalRouter(nn.Module):
-    def __init__(self, hidden_size, num_loras, temperature=1.0, diversity_weight=0.1):
+    def __init__(self, hidden_size, num_loras, temperature=1.0, diversity_weight=0.1, expert_dropout=0.2):
         super().__init__()
         self.router = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
@@ -281,6 +284,7 @@ class GlobalRouter(nn.Module):
         self.temperature = temperature
         self.diversity_weight = diversity_weight
         self.num_loras = num_loras
+        self.expert_dropout = expert_dropout  # Probability of dropping each expert
         
         # Register buffers to track usage statistics (will be saved with model)
         self.register_buffer('usage_count', torch.zeros(num_loras))
@@ -290,6 +294,31 @@ class GlobalRouter(nn.Module):
     def forward(self, x, return_loss=False):
         pooled = x[:, 0]
         logits = self.router(pooled.to(self.router[0].weight.dtype))
+        
+        # Apply expert dropout during training
+        if self.training and self.expert_dropout > 0:
+            # Create a dropout mask - randomly set some logits to -inf
+            # Importantly, we ensure at least one expert remains active
+            batch_size = pooled.shape[0]
+            dropout_mask = torch.ones_like(logits, device=logits.device)
+            
+            # For each example in the batch
+            for i in range(batch_size):
+                # Randomly select which experts to drop
+                drop_mask = torch.rand(self.num_loras, device=logits.device) < self.expert_dropout
+                
+                # Ensure we don't drop all experts (always keep at least one)
+                if drop_mask.all():
+                    # Keep one random expert
+                    keep_idx = torch.randint(0, self.num_loras, (1,), device=logits.device)
+                    drop_mask[keep_idx] = False
+                
+                # Set the logits of dropped experts to -inf
+                dropout_mask[i, drop_mask] = float('-inf')
+            
+            # Apply the mask
+            logits = logits + dropout_mask
+        
         # Apply temperature scaling - higher temperature = more uniform distribution
         scaled_logits = logits / self.temperature
         probs = torch.softmax(scaled_logits, dim=-1)
@@ -368,7 +397,7 @@ class QwenRouterWrapper(nn.Module):
             param.requires_grad = False
         print("Base model frozen.")
 
-    def __init__(self, model, router_cutoff_layer=2, num_loras=4, lora_r=8, lora_alpha=16, temperature=1.0, diversity_weight=0.1):
+    def __init__(self, model, router_cutoff_layer=2, num_loras=4, lora_r=8, lora_alpha=16, temperature=1.0, diversity_weight=0.1, expert_dropout=0.2):
         super().__init__()
         self.model = model
         self.config = model.config
@@ -380,7 +409,7 @@ class QwenRouterWrapper(nn.Module):
         total_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print(f"Trainable parameters: {total_trainable:,}")
 
-        self.router = GlobalRouter(model.config.hidden_size, num_loras, temperature, diversity_weight)
+        self.router = GlobalRouter(model.config.hidden_size, num_loras, temperature, diversity_weight, expert_dropout)
         self.modified_layers = nn.ModuleList()
 
         for i, block in enumerate(model.model.layers):
@@ -510,7 +539,8 @@ def train():
         lora_r=128,
         lora_alpha=256,
         temperature=3.0,  # High temperature for more uniform initial distribution
-        diversity_weight=0.5  # Fairly strong diversity penalty to encourage uniform usage
+        diversity_weight=0.5,  # Fairly strong diversity penalty to encourage uniform usage
+        expert_dropout=0.3  # Drop each expert with 30% probability during training
     )
     
     # Count trainable parameters
@@ -550,6 +580,7 @@ def train():
     args.ddp_find_unused_parameters = False
     
     # Initialize WandB if project is specified
+    # No need, we use default wandb settings
     # if config.wandb_project and config.wandb_entity:
     #     wandb.init(
     #         project=config.wandb_project,
@@ -581,6 +612,7 @@ def train():
     trainer.add_callback(router_callback)
 
     trainer.train()
+    # Note: commented out until we have a good result to save
     # trainer.save_model(output_dir=args.output_dir)
     # tokenizer.save_pretrained(args.output_dir)
     
