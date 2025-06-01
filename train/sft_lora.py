@@ -142,12 +142,14 @@ class RouterAnalysisCallback(transformers.TrainerCallback):
             # Log raw data
             diversity_loss = getattr(self.model.router, 'last_diversity_loss', 0.0)
             expert_dropout = getattr(self.model.router, 'expert_dropout', 0.0)
+            top_k = getattr(self.model.router, 'top_k', 1)
             
             wandb.log({
                 "router/temperature": temperature,
                 "router/avg_entropy": np.mean([log['entropy'] for log in step_logs]) if step_logs else 0.0,
                 "router/diversity_loss": diversity_loss,
-                "router/expert_dropout": expert_dropout
+                "router/expert_dropout": expert_dropout,
+                "router/top_k": top_k
             }, step=step)
             
             # Generate and log visualization if we have enough data points
@@ -273,7 +275,7 @@ class LoRALayer(nn.Module):
 
 
 class GlobalRouter(nn.Module):
-    def __init__(self, hidden_size, num_loras, temperature=1.0, diversity_weight=0.1, expert_dropout=0.2):
+    def __init__(self, hidden_size, num_loras, temperature=1.0, diversity_weight=0.1, expert_dropout=0.2, top_k=2):
         super().__init__()
         self.router = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
@@ -285,6 +287,7 @@ class GlobalRouter(nn.Module):
         self.diversity_weight = diversity_weight
         self.num_loras = num_loras
         self.expert_dropout = expert_dropout  # Probability of dropping each expert
+        self.top_k = min(top_k, num_loras)  # Ensure top_k is not greater than num_loras
         
         # Register buffers to track usage statistics (will be saved with model)
         self.register_buffer('usage_count', torch.zeros(num_loras))
@@ -313,22 +316,42 @@ class GlobalRouter(nn.Module):
                     keep_idx = torch.randint(0, self.num_loras, (1,), device=logits.device)
                     drop_mask[keep_idx] = False
                 
+                # Ensure we keep at least top_k experts (don't drop too many)
+                if drop_mask.sum() > self.num_loras - self.top_k:
+                    # Find top-k experts
+                    _, top_indices = torch.topk(logits[i], self.top_k)
+                    # Make sure they're not dropped
+                    drop_mask[top_indices] = False
+                
                 # Set the logits of dropped experts to -inf
                 dropout_mask[i, drop_mask] = float('-inf')
             
             # Apply the mask
             logits = logits + dropout_mask
         
-        # Apply temperature scaling - higher temperature = more uniform distribution
+        # Apply temperature scaling
         scaled_logits = logits / self.temperature
-        probs = torch.softmax(scaled_logits, dim=-1)
+        
+        # Implement top-k routing - only keep top k logits per example
+        batch_size = pooled.shape[0]
+        top_k_mask = torch.zeros_like(scaled_logits, device=scaled_logits.device) - float('inf')
+        
+        for i in range(batch_size):
+            # Find the indices of the top-k values
+            top_k_values, top_k_indices = torch.topk(scaled_logits[i], self.top_k)
+            # Place the top-k values in the mask
+            top_k_mask[i, top_k_indices] = top_k_values
+        
+        # Apply softmax only over the top-k logits
+        probs = torch.softmax(top_k_mask, dim=-1)
         self.cached_probs = probs[0]  # shape: [num_loras]
         
         # Update usage statistics when training
         if self.training:
             with torch.no_grad():
-                # Add current probabilities to running count
-                self.usage_count += self.cached_probs.detach()
+                # Add current probabilities to running count (for all examples in batch)
+                batch_usage = probs.mean(dim=0)
+                self.usage_count += batch_usage.detach()
                 self.total_samples += 1
         
         # Calculate diversity loss if requested
@@ -341,8 +364,14 @@ class GlobalRouter(nn.Module):
             uniform_dist = torch.ones_like(usage_dist) / self.num_loras
             kl_div = torch.sum(usage_dist * torch.log((usage_dist + 1e-10) / (uniform_dist + 1e-10)))
             
-            # Use KL divergence as diversity loss
-            diversity_loss = self.diversity_weight * kl_div
+            # Calculate load balancing loss (penalize deviation from uniform)
+            # This is based on the Switch Transformer approach
+            router_prob_per_expert = probs.mean(dim=0)  # Mean across batch
+            router_prob_per_expert = router_prob_per_expert.clamp(min=1e-10)  # Avoid zeros
+            load_balancing_loss = self.num_loras * torch.sum(router_prob_per_expert * router_prob_per_expert)
+            
+            # Combine KL divergence with load balancing loss
+            diversity_loss = self.diversity_weight * (kl_div + 0.5 * load_balancing_loss)
             self.last_diversity_loss = diversity_loss.item()
             
             return self.cached_probs, diversity_loss
@@ -364,16 +393,20 @@ class LayerWithLoRAMixture(nn.Module):
             return out
             
         # Process each LoRA separately and combine
+        # Only active LoRAs (those with non-zero probability) will contribute
         lora_outputs = []
         for i, lora in enumerate(self.lora_list):
-            lora_out = lora(x) * probs[i]  # Scale output by router probability
-            lora_outputs.append(lora_out)
+            if probs[i] > 0:  # Only process LoRAs with non-zero probability
+                lora_out = lora(x) * probs[i]  # Scale output by router probability
+                lora_outputs.append(lora_out)
             
         # Sum all lora outputs
-        lora_contribution = sum(lora_outputs)
-        
-        # Add to base output
-        return out + lora_contribution
+        if lora_outputs:  # Check if there are any outputs to sum
+            lora_contribution = sum(lora_outputs)
+            # Add to base output
+            return out + lora_contribution
+        else:
+            return out
 
 # === Utility ===
 
@@ -397,7 +430,8 @@ class QwenRouterWrapper(nn.Module):
             param.requires_grad = False
         print("Base model frozen.")
 
-    def __init__(self, model, router_cutoff_layer=2, num_loras=4, lora_r=8, lora_alpha=16, temperature=1.0, diversity_weight=0.1, expert_dropout=0.2):
+    def __init__(self, model, router_cutoff_layer=2, num_loras=4, lora_r=8, lora_alpha=16, temperature=1.0, 
+                 diversity_weight=0.1, expert_dropout=0.2, top_k=2):
         super().__init__()
         self.model = model
         self.config = model.config
@@ -409,7 +443,8 @@ class QwenRouterWrapper(nn.Module):
         total_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print(f"Trainable parameters: {total_trainable:,}")
 
-        self.router = GlobalRouter(model.config.hidden_size, num_loras, temperature, diversity_weight, expert_dropout)
+        self.router = GlobalRouter(model.config.hidden_size, num_loras, temperature, diversity_weight, 
+                                  expert_dropout, top_k)
         self.modified_layers = nn.ModuleList()
 
         for i, block in enumerate(model.model.layers):
@@ -540,7 +575,8 @@ def train():
         lora_alpha=256,
         temperature=3.0,  # High temperature for more uniform initial distribution
         diversity_weight=0.5,  # Fairly strong diversity penalty to encourage uniform usage
-        expert_dropout=0.3  # Drop each expert with 30% probability during training
+        expert_dropout=0.3,  # Drop each expert with 30% probability during training
+        top_k=2  # Select top 2 LoRAs for each input
     )
     
     # Count trainable parameters
