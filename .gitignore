@@ -2,3 +2,9 @@ ckpts/
 
 wandb/
 
+data/
+
+simplescaling/
+
+**/__pycache__/
+**/*.pyc
